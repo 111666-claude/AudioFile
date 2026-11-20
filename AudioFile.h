@@ -100,7 +100,24 @@ public:
      * @Returns true if the file was successfully loaded
      */
     bool load (const std::string& filePath);
-    
+
+    /** Loads only a section of an audio file from a given file path, reading
+     * just the PCM bytes needed for that section (plus the file header) rather
+     * than the whole file into memory.
+     *
+     * @param startSampleInFile the index of the first sample (per channel) to read
+     * @param numSamplesToRead the number of samples (per channel) to read
+     * @param truncateAtEndOfFile if true, a request extending past the end of the
+     * file is silently truncated to the available samples; if false, such a
+     * request fails and the function returns false
+     *
+     * @Returns true if the section was successfully loaded. On success, the
+     * samples buffer holds exactly the same values that a full load() followed
+     * by slicing to the same sample range would produce, and the sample rate,
+     * number of channels and bit depth reflect the file.
+     */
+    bool loadSection (const std::string& filePath, int64_t startSampleInFile, int64_t numSamplesToRead, bool truncateAtEndOfFile = true);
+
     /** Saves an audio file to a given file path.
      * @Returns true if the file was successfully saved
      */
@@ -194,6 +211,18 @@ private:
     //=============================================================
     bool decodeWaveFile (const std::vector<uint8_t>& fileData);
     bool decodeAiffFile (const std::vector<uint8_t>& fileData);
+
+    //=============================================================
+    bool loadWaveSection (std::ifstream& file, int64_t fileSize, int64_t startSampleInFile, int64_t numSamplesToRead, bool truncateAtEndOfFile);
+    bool loadAiffSection (std::ifstream& file, int64_t fileSize, int64_t startSampleInFile, int64_t numSamplesToRead, bool truncateAtEndOfFile);
+
+    //=============================================================
+    bool decodePcmSection (const std::vector<uint8_t>& fileData, int numChannels, int numFrames, int numBytesPerSample,
+                          Endianness endianness, int fileBitDepth, bool isFloatingPoint, bool isAiff);
+
+    //=============================================================
+    static inline bool readBytesAt (std::ifstream& file, int64_t offset, std::vector<uint8_t>& destination, size_t numBytes);
+    static inline bool checkedMultiply (int64_t value1, int64_t value2, int64_t& result);
 
     //=============================================================
     bool encodeWaveFile (std::vector<uint8_t>& fileData);
@@ -546,6 +575,114 @@ bool AudioFile<T>::loadFromMemory (const std::vector<uint8_t>& fileData)
 
 //=============================================================
 template <class T>
+bool AudioFile<T>::loadSection (const std::string& filePath, int64_t startSampleInFile, int64_t numSamplesToRead, bool truncateAtEndOfFile)
+{
+    // a negative start, a negative or zero length are always invalid
+    if (startSampleInFile < 0 || numSamplesToRead <= 0)
+    {
+        reportError ("ERROR: loadSection requires a non-negative start sample and a positive number of samples");
+        return false;
+    }
+
+    // an overflowing requested span is always invalid, even when truncation at
+    // the end of the file is enabled (truncation only handles spans that are
+    // arithmetically valid but extend past the last sample)
+    if (startSampleInFile >= std::numeric_limits<int64_t>::max() - numSamplesToRead)
+    {
+        reportError ("ERROR: the requested sample range overflows the range of valid sample indices");
+        return false;
+    }
+
+    std::ifstream file (filePath, std::ios::binary);
+
+    // check the file exists
+    if (! file.good())
+    {
+        reportError ("ERROR: File doesn't exist or otherwise can't load file\n"  + filePath);
+        return false;
+    }
+
+    file.unsetf (std::ios::skipws);
+    file.seekg (0, std::ios::end);
+    int64_t fileSize = static_cast<int64_t> (file.tellg());
+    file.seekg (0, std::ios::beg);
+
+    // Handle very small files that will break our attempt to read the
+    // first header info from them
+    if (fileSize < 12)
+    {
+        reportError ("ERROR: File is not a valid audio file\n" + filePath);
+        return false;
+    }
+
+    std::vector<uint8_t> header (12);
+
+    if (! readBytesAt (file, 0, header, 12))
+    {
+        reportError ("ERROR: Couldn't read the file header\n" + filePath);
+        return false;
+    }
+
+    std::string headerChunkID (header.begin(), header.begin() + 4);
+    std::string format (header.begin() + 8, header.begin() + 12);
+
+    if (headerChunkID == "RIFF" && format == "WAVE")
+    {
+        return loadWaveSection (file, fileSize, startSampleInFile, numSamplesToRead, truncateAtEndOfFile);
+    }
+    else if (headerChunkID == "FORM" && (format == "AIFF" || format == "AIFC"))
+    {
+        return loadAiffSection (file, fileSize, startSampleInFile, numSamplesToRead, truncateAtEndOfFile);
+    }
+    else
+    {
+        reportError ("Audio File Type: Error");
+        return false;
+    }
+}
+
+//=============================================================
+template <class T>
+bool AudioFile<T>::readBytesAt (std::ifstream& file, int64_t offset, std::vector<uint8_t>& destination, size_t numBytes)
+{
+    if (offset < 0)
+        return false;
+
+    file.clear();
+    file.seekg (static_cast<std::streamoff> (offset), std::ios::beg);
+
+    if (! file.good())
+        return false;
+
+    destination.resize (numBytes);
+
+    if (numBytes == 0)
+        return true;
+
+    file.read (reinterpret_cast<char*> (destination.data()), static_cast<std::streamsize> (numBytes));
+
+    return file.gcount() == static_cast<std::streamsize> (numBytes);
+}
+
+//=============================================================
+template <class T>
+bool AudioFile<T>::checkedMultiply (int64_t value1, int64_t value2, int64_t& result)
+{
+    if (value1 != 0 && value2 != 0)
+    {
+        if ((value1 > std::numeric_limits<int64_t>::max() / value2) ||
+            (value1 < std::numeric_limits<int64_t>::min() / value2))
+        {
+            return false;
+        }
+    }
+
+    result = value1 * value2;
+    return true;
+}
+
+//=============================================================
+template <class T>
 bool AudioFile<T>::decodeWaveFile (const std::vector<uint8_t>& fileData)
 {
     // -----------------------------------------------------------
@@ -854,7 +991,515 @@ bool AudioFile<T>::decodeAiffFile (const std::vector<uint8_t>& fileData)
         int32_t chunkSize = fourBytesToInt (fileData, indexOfXMLChunk + 4);
         iXMLChunk = std::string (reinterpret_cast<const char*> (&fileData[indexOfXMLChunk + 8]), chunkSize);
     }
-    
+
+    return true;
+}
+
+//=============================================================
+template <class T>
+bool AudioFile<T>::loadWaveSection (std::ifstream& file, int64_t fileSize, int64_t startSampleInFile, int64_t numSamplesToRead, bool truncateAtEndOfFile)
+{
+    // -----------------------------------------------------------
+    // Walk the RIFF chunk list without reading any chunk payloads
+    int64_t fmtChunkOffset = -1;
+    int32_t fmtChunkSize = 0;
+    int64_t dataChunkOffset = -1;
+    int32_t dataChunkSize = 0;
+
+    int64_t position = 12;
+
+    while (position + 8 <= fileSize)
+    {
+        std::vector<uint8_t> chunkHeader;
+
+        if (! readBytesAt (file, position, chunkHeader, 8))
+        {
+            reportError ("ERROR: this doesn't seem to be a valid .WAV file");
+            return false;
+        }
+
+        std::string chunkID (chunkHeader.begin(), chunkHeader.begin() + 4);
+        int32_t chunkSize = fourBytesToInt (chunkHeader, 4, Endianness::LittleEndian);
+
+        // a negative or oversized chunk size means a corrupted chunk
+        if (chunkSize < 0 || position + 8 + static_cast<int64_t> (chunkSize) > fileSize)
+        {
+            reportError ("ERROR: this doesn't seem to be a valid .WAV file");
+            return false;
+        }
+
+        if (chunkID == "fmt ")
+        {
+            fmtChunkOffset = position;
+            fmtChunkSize = chunkSize;
+        }
+        else if (chunkID == "data")
+        {
+            dataChunkOffset = position;
+            dataChunkSize = chunkSize;
+        }
+
+        // chunks are word-aligned, so an odd-sized chunk is followed by a pad byte
+        position += 8 + static_cast<int64_t> (chunkSize) + (static_cast<int64_t> (chunkSize) & 1);
+    }
+
+    if (fmtChunkOffset == -1 || dataChunkOffset == -1)
+    {
+        reportError ("ERROR: this doesn't seem to be a valid .WAV file");
+        return false;
+    }
+
+    // -----------------------------------------------------------
+    // FORMAT CHUNK
+    if (fmtChunkSize < 16)
+    {
+        reportError ("ERROR: this doesn't seem to be a valid .WAV file");
+        return false;
+    }
+
+    std::vector<uint8_t> fmtChunk;
+
+    if (! readBytesAt (file, fmtChunkOffset, fmtChunk, static_cast<size_t> (fmtChunkSize + 8)))
+    {
+        reportError ("ERROR: this doesn't seem to be a valid .WAV file");
+        return false;
+    }
+
+    uint16_t audioFormat = twoBytesToInt (fmtChunk, 8);
+    uint16_t numChannels = twoBytesToInt (fmtChunk, 10);
+    uint32_t waveSampleRate = static_cast<uint32_t> (fourBytesToInt (fmtChunk, 12));
+    uint32_t numBytesPerSecond = fourBytesToInt (fmtChunk, 16);
+    uint16_t numBytesPerBlock = twoBytesToInt (fmtChunk, 20);
+    int waveBitDepth = static_cast<int> (twoBytesToInt (fmtChunk, 22));
+
+    if (waveBitDepth > static_cast<int> (sizeof (T) * 8))
+    {
+        std::string message = "ERROR: you are trying to read a ";
+        message += std::to_string (waveBitDepth);
+        message += "-bit file using a ";
+        message += std::to_string (sizeof (T) * 8);
+        message += "-bit sample type";
+        reportError (message);
+        return false;
+    }
+
+    int numBytesPerSample = waveBitDepth / 8;
+
+    // check that the audio format is PCM or Float or extensible
+    if (audioFormat != WavAudioFormat::PCM && audioFormat != WavAudioFormat::IEEEFloat && audioFormat != WavAudioFormat::Extensible)
+    {
+        reportError ("ERROR: this .WAV file is encoded in a format that this library does not support at present");
+        return false;
+    }
+
+    // check the number of channels is mono or stereo
+    if (numChannels < 1 || numChannels > 128)
+    {
+        reportError ("ERROR: this WAV file seems to be an invalid number of channels (or corrupted?)");
+        return false;
+    }
+
+    // check header data is consistent
+    if (numBytesPerSecond != static_cast<uint32_t> ((numChannels * waveSampleRate * waveBitDepth) / 8) || numBytesPerBlock != (numChannels * numBytesPerSample))
+    {
+        reportError ("ERROR: the header data in this WAV file seems to be inconsistent");
+        return false;
+    }
+
+    // check bit depth is either 8, 16, 24 or 32 bit
+    if (waveBitDepth != 8 && waveBitDepth != 16 && waveBitDepth != 24 && waveBitDepth != 32)
+    {
+        reportError ("ERROR: this file has a bit depth that is not 8, 16, 24 or 32 bits");
+        return false;
+    }
+
+    // WAVE_FORMAT_EXTENSIBLE carries the real format in the extension's sub-format GUID
+    bool isFloatingPoint = (audioFormat == WavAudioFormat::IEEEFloat);
+
+    if (audioFormat == WavAudioFormat::Extensible && fmtChunkSize >= 40)
+    {
+        // the first two bytes of the sub-format GUID hold the actual format code
+        uint16_t subFormat = twoBytesToInt (fmtChunk, 40);
+        isFloatingPoint = (subFormat == WavAudioFormat::IEEEFloat);
+    }
+
+    // -----------------------------------------------------------
+    // DATA CHUNK
+    int64_t dataStart = dataChunkOffset + 8;
+    int64_t numFramesInFile = static_cast<int64_t> (dataChunkSize) / static_cast<int64_t> (numBytesPerBlock);
+
+    // the data chunk must contain whole frames, i.e. a truncated data block is an error
+    if (dataChunkSize < 0 || static_cast<int64_t> (dataChunkSize) % static_cast<int64_t> (numBytesPerBlock) != 0 ||
+        dataStart + static_cast<int64_t> (dataChunkSize) > fileSize)
+    {
+        reportError ("ERROR: read file error as the metadata indicates more samples than there are in the file data");
+        return false;
+    }
+
+    if (startSampleInFile >= numFramesInFile)
+    {
+        reportError ("ERROR: the requested start sample is past the end of the audio file");
+        return false;
+    }
+
+    int64_t framesAvailable = numFramesInFile - startSampleInFile;
+    int64_t numFramesToRead = numSamplesToRead;
+
+    if (numFramesToRead > framesAvailable)
+    {
+        if (! truncateAtEndOfFile)
+        {
+            reportError ("ERROR: the requested section extends past the end of the audio file");
+            return false;
+        }
+
+        numFramesToRead = framesAvailable;
+    }
+
+    int64_t frameSize = numBytesPerBlock;
+    int64_t sectionByteOffset;
+    int64_t sectionByteLength;
+
+    if (! checkedMultiply (startSampleInFile, frameSize, sectionByteOffset) || sectionByteOffset > dataChunkSize)
+    {
+        reportError ("ERROR: overflow when calculating the section position in the audio file");
+        return false;
+    }
+
+    if (! checkedMultiply (numFramesToRead, frameSize, sectionByteLength) ||
+        sectionByteOffset + sectionByteLength > static_cast<int64_t> (dataChunkSize))
+    {
+        reportError ("ERROR: overflow when calculating the section length in the audio file");
+        return false;
+    }
+
+    std::vector<uint8_t> pcmData;
+
+    if (! readBytesAt (file, dataStart + sectionByteOffset, pcmData, static_cast<size_t> (sectionByteLength)))
+    {
+        reportError ("ERROR: couldn't read the requested audio section from the file");
+        return false;
+    }
+
+    // -----------------------------------------------------------
+    // Decode and take ownership of the buffer only once everything succeeded
+    clearAudioBuffer();
+    iXMLChunk.clear();
+    sampleRate = waveSampleRate;
+    bitDepth = waveBitDepth;
+    audioFileFormat = AudioFileFormat::Wave;
+
+    if (! decodePcmSection (pcmData, static_cast<int> (numChannels), static_cast<int> (numFramesToRead),
+                            numBytesPerSample, Endianness::LittleEndian, waveBitDepth, isFloatingPoint, false))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+//=============================================================
+template <class T>
+bool AudioFile<T>::loadAiffSection (std::ifstream& file, int64_t fileSize, int64_t startSampleInFile, int64_t numSamplesToRead, bool truncateAtEndOfFile)
+{
+    // -----------------------------------------------------------
+    // Walk the FORM chunk list without reading any chunk payloads
+    int64_t commChunkOffset = -1;
+    int32_t commChunkSize = 0;
+    int64_t ssndChunkOffset = -1;
+    int32_t ssndChunkSize = 0;
+
+    int64_t position = 12;
+
+    while (position + 8 <= fileSize)
+    {
+        std::vector<uint8_t> chunkHeader;
+
+        if (! readBytesAt (file, position, chunkHeader, 8))
+        {
+            reportError ("ERROR: this doesn't seem to be a valid AIFF file");
+            return false;
+        }
+
+        std::string chunkID (chunkHeader.begin(), chunkHeader.begin() + 4);
+        int32_t chunkSize = fourBytesToInt (chunkHeader, 4, Endianness::BigEndian);
+
+        // a negative or oversized chunk size means a corrupted chunk
+        if (chunkSize < 0 || position + 8 + static_cast<int64_t> (chunkSize) > fileSize)
+        {
+            reportError ("ERROR: this doesn't seem to be a valid AIFF file");
+            return false;
+        }
+
+        if (chunkID == "COMM")
+        {
+            commChunkOffset = position;
+            commChunkSize = chunkSize;
+        }
+        else if (chunkID == "SSND")
+        {
+            ssndChunkOffset = position;
+            ssndChunkSize = chunkSize;
+        }
+
+        // chunks are word-aligned, so an odd-sized chunk is followed by a pad byte
+        position += 8 + static_cast<int64_t> (chunkSize) + (static_cast<int64_t> (chunkSize) & 1);
+    }
+
+    if (commChunkOffset == -1 || ssndChunkOffset == -1)
+    {
+        reportError ("ERROR: this doesn't seem to be a valid AIFF file");
+        return false;
+    }
+
+    // -----------------------------------------------------------
+    // COMM CHUNK (the standard payload is 18 bytes; larger extension payloads are allowed)
+    if (commChunkSize < 18)
+    {
+        reportError ("ERROR: this doesn't seem to be a valid AIFF file");
+        return false;
+    }
+
+    std::vector<uint8_t> commChunk;
+
+    if (! readBytesAt (file, commChunkOffset, commChunk, static_cast<size_t> (commChunkSize + 8)))
+    {
+        reportError ("ERROR: this doesn't seem to be a valid AIFF file");
+        return false;
+    }
+
+    int16_t numChannels = twoBytesToInt (commChunk, 8, Endianness::BigEndian);
+    int32_t numFramesInComm = fourBytesToInt (commChunk, 10, Endianness::BigEndian);
+    int aiffBitDepth = static_cast<int> (twoBytesToInt (commChunk, 14, Endianness::BigEndian));
+    uint32_t aiffSampleRate = static_cast<uint32_t> (AiffUtilities::decodeAiffSampleRate (&commChunk[16]));
+
+    if (aiffBitDepth > static_cast<int> (sizeof (T) * 8))
+    {
+        std::string message = "ERROR: you are trying to read a ";
+        message += std::to_string (aiffBitDepth);
+        message += "-bit file using a ";
+        message += std::to_string (sizeof (T) * 8);
+        message += "-bit sample type";
+        reportError (message);
+        return false;
+    }
+
+    // check the sample rate was properly decoded
+    if (aiffSampleRate == 0)
+    {
+        reportError ("ERROR: this AIFF file has an unsupported sample rate");
+        return false;
+    }
+
+    // check the number of channels is mono or stereo
+    if (numChannels < 1 || numChannels > 2)
+    {
+        reportError ("ERROR: this AIFF file seems to be neither mono nor stereo (perhaps multi-track, or corrupted?)");
+        return false;
+    }
+
+    // check bit depth is either 8, 16, 24 or 32-bit
+    if (aiffBitDepth != 8 && aiffBitDepth != 16 && aiffBitDepth != 24 && aiffBitDepth != 32)
+    {
+        reportError ("ERROR: this file has a bit depth that is not 8, 16, 24 or 32 bits");
+        return false;
+    }
+
+    // -----------------------------------------------------------
+    // SSND CHUNK
+    if (ssndChunkSize < 8)
+    {
+        reportError ("ERROR: the metadatafor this file doesn't seem right");
+        return false;
+    }
+
+    std::vector<uint8_t> ssndHeader;
+
+    if (! readBytesAt (file, ssndChunkOffset, ssndHeader, 16))
+    {
+        reportError ("ERROR: the metadatafor this file doesn't seem right");
+        return false;
+    }
+
+    int32_t soundDataOffset = fourBytesToInt (ssndHeader, 8, Endianness::BigEndian);
+    //int32_t blockSize = fourBytesToInt (ssndHeader, 12, Endianness::BigEndian);
+
+    if (soundDataOffset < 0)
+    {
+        reportError ("ERROR: the metadatafor this file doesn't seem right");
+        return false;
+    }
+
+    int numBytesPerSample = aiffBitDepth / 8;
+    int numBytesPerFrame = numBytesPerSample * numChannels;
+    int64_t totalNumAudioSampleBytes = static_cast<int64_t> (numFramesInComm) * static_cast<int64_t> (numBytesPerFrame);
+    int64_t dataStart = ssndChunkOffset + 16 + static_cast<int64_t> (soundDataOffset);
+
+    // sanity check the data, matching the checks performed by the full AIFF loader
+    if ((static_cast<int64_t> (ssndChunkSize) - 8) != totalNumAudioSampleBytes ||
+        soundDataOffset > static_cast<int64_t> (ssndChunkSize) - 8 ||
+        totalNumAudioSampleBytes > fileSize - dataStart)
+    {
+        reportError ("ERROR: the metadatafor this file doesn't seem right");
+        return false;
+    }
+
+    if (startSampleInFile >= static_cast<int64_t> (numFramesInComm))
+    {
+        reportError ("ERROR: the requested start sample is past the end of the audio file");
+        return false;
+    }
+
+    int64_t framesAvailable = static_cast<int64_t> (numFramesInComm) - startSampleInFile;
+    int64_t numFramesToRead = numSamplesToRead;
+
+    if (numFramesToRead > framesAvailable)
+    {
+        if (! truncateAtEndOfFile)
+        {
+            reportError ("ERROR: the requested section extends past the end of the audio file");
+            return false;
+        }
+
+        numFramesToRead = framesAvailable;
+    }
+
+    int64_t frameSize = numBytesPerFrame;
+    int64_t sectionByteOffset;
+    int64_t sectionByteLength;
+
+    if (! checkedMultiply (startSampleInFile, frameSize, sectionByteOffset) ||
+        sectionByteOffset > totalNumAudioSampleBytes)
+    {
+        reportError ("ERROR: overflow when calculating the section position in the audio file");
+        return false;
+    }
+
+    if (! checkedMultiply (numFramesToRead, frameSize, sectionByteLength) ||
+        sectionByteOffset + sectionByteLength > totalNumAudioSampleBytes)
+    {
+        reportError ("ERROR: overflow when calculating the section length in the audio file");
+        return false;
+    }
+
+    std::vector<uint8_t> pcmData;
+
+    if (! readBytesAt (file, dataStart + sectionByteOffset, pcmData, static_cast<size_t> (sectionByteLength)))
+    {
+        reportError ("ERROR: couldn't read the requested audio section from the file");
+        return false;
+    }
+
+    // -----------------------------------------------------------
+    // Decode and take ownership of the buffer only once everything succeeded
+    clearAudioBuffer();
+    iXMLChunk.clear();
+    sampleRate = aiffSampleRate;
+    bitDepth = aiffBitDepth;
+    audioFileFormat = AudioFileFormat::Aiff;
+
+    if (! decodePcmSection (pcmData, static_cast<int> (numChannels), static_cast<int> (numFramesToRead),
+                            numBytesPerSample, Endianness::BigEndian, aiffBitDepth, false, true))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+//=============================================================
+template <class T>
+bool AudioFile<T>::decodePcmSection (const std::vector<uint8_t>& fileData, int numChannels, int numFrames,
+                                     int numBytesPerSample, Endianness endianness, int fileBitDepth,
+                                     bool isFloatingPoint, bool isAiff)
+{
+    int numBytesPerFrame = numBytesPerSample * numChannels;
+
+    if (numBytesPerFrame <= 0 || numFrames < 0 || numChannels <= 0)
+    {
+        reportError ("ERROR: invalid audio section parameters");
+        return false;
+    }
+
+    // make sure the buffer really holds every frame we are about to decode
+    if (static_cast<int64_t> (fileData.size()) < static_cast<int64_t> (numFrames) * static_cast<int64_t> (numBytesPerFrame))
+    {
+        reportError ("ERROR: read file error as the metadata indicates more samples than there are in the file data");
+        return false;
+    }
+
+    samples.resize (numChannels);
+
+    for (int channel = 0; channel < numChannels; channel++)
+        samples[channel].reserve (static_cast<size_t> (numFrames));
+
+    for (int i = 0; i < numFrames; i++)
+    {
+        for (int channel = 0; channel < numChannels; channel++)
+        {
+            size_t sampleIndex = static_cast<size_t> ((numBytesPerFrame * i) + channel * numBytesPerSample);
+
+            if (fileBitDepth == 8)
+            {
+                T sample;
+
+                if (isAiff)
+                    sample = AudioSampleConverter<T>::signedByteToSample (static_cast<int8_t> (fileData[sampleIndex]));
+                else
+                    sample = AudioSampleConverter<T>::unsignedByteToSample (fileData[sampleIndex]);
+
+                samples[channel].push_back (sample);
+            }
+            else if (fileBitDepth == 16)
+            {
+                int16_t sampleAsInt = twoBytesToInt (fileData, static_cast<int> (sampleIndex), endianness);
+                T sample = AudioSampleConverter<T>::sixteenBitIntToSample (sampleAsInt);
+                samples[channel].push_back (sample);
+            }
+            else if (fileBitDepth == 24)
+            {
+                int32_t sampleAsInt = 0;
+
+                if (endianness == Endianness::LittleEndian)
+                {
+                    sampleAsInt = (fileData[sampleIndex + 2] << 16) | (fileData[sampleIndex + 1] << 8) | fileData[sampleIndex];
+                }
+                else
+                {
+                    sampleAsInt = (fileData[sampleIndex] << 16) | (fileData[sampleIndex + 1] << 8) | fileData[sampleIndex + 2];
+                }
+
+                if (sampleAsInt & 0x800000) //  if the 24th bit is set, this is a negative number in 24-bit world
+                    sampleAsInt = sampleAsInt | ~0xFFFFFF; // so make sure sign is extended to the 32 bit float
+
+                T sample = AudioSampleConverter<T>::twentyFourBitIntToSample (sampleAsInt);
+                samples[channel].push_back (sample);
+            }
+            else if (fileBitDepth == 32)
+            {
+                int32_t sampleAsInt = fourBytesToInt (fileData, static_cast<int> (sampleIndex), endianness);
+                T sample;
+
+                if (isFloatingPoint && std::is_floating_point_v<T>)
+                {
+                    float floatValue;
+                    memcpy (&floatValue, &sampleAsInt, sizeof (int32_t));
+                    sample = static_cast<T> (floatValue);
+                }
+                else // assume PCM
+                {
+                    sample = AudioSampleConverter<T>::thirtyTwoBitIntToSample (sampleAsInt);
+                }
+
+                samples[channel].push_back (sample);
+            }
+            else
+            {
+                assert (false);
+            }
+        }
+    }
+
     return true;
 }
 

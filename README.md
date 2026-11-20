@@ -31,6 +31,28 @@ AudioFile is written and maintained by Adam Stark.
 
     audioFile.load ("/path/to/my/audiofile.wav");
 
+### Load only a section of an audio file:
+
+For a long recording, you may only need a short fragment. `loadSection()` reads
+just the header and the PCM bytes for the requested sample range, instead of
+loading the whole file into memory:
+
+    // read 10 samples per channel, starting at sample index 33600
+    audioFile.loadSection ("/path/to/my/audiofile.wav", 33600, 10);
+
+The returned samples are identical to a full `load()` followed by slicing to
+the same range, and `getSampleRate()`, `getNumChannels()` and `getBitDepth()`
+still describe the source file. If the request extends past the last sample,
+it is truncated to the available samples by default; pass `false` as the final
+argument to fail instead:
+
+    bool truncated = true;   // default: clamp to the end of the file
+    audioFile.loadSection (path, startSample, numSamples, truncated);
+
+A negative start sample, a zero or negative sample count, an overflowing
+range, or a truncated/corrupt data block makes the function return `false`
+and leave the existing buffer untouched. Both WAV and AIFF are supported.
+
 ### Get some information about the loaded audio:
 
     int sampleRate = audioFile.getSampleRate();
